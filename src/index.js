@@ -179,7 +179,7 @@ app.post('/v1/messages', async (req, res) => {
 /**
  * Pass through other endpoints
  */
-app.all('*', async (req, res) => {
+app.all(/.*/, async (req, res) => {
   try {
     const response = await axios({
       method: req.method,
