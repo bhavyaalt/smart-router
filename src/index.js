@@ -5,9 +5,13 @@
 
 const express = require('express');
 const axios = require('axios');
-const { classify } = require('./classifier');
+const { classify: classifyHeuristics } = require('./classifier');
+const { classify: classifyOllama, isOllamaAvailable } = require('./ollama-classifier');
 
 const app = express();
+
+// Track Ollama availability
+let ollamaAvailable = false;
 app.use(express.json({ limit: '50mb' }));
 
 // Configuration
@@ -78,8 +82,9 @@ function logDecision(originalModel, newModel, classification, prompt) {
   const arrow = changed ? '→' : '=';
   const color = changed ? '\x1b[33m' : '\x1b[32m'; // Yellow if changed, green if same
   const reset = '\x1b[0m';
+  const source = classification.source === 'ollama' ? '🧠' : '📏';
   
-  console.log(`${color}[${classification.tier.toUpperCase()}]${reset} Score: ${classification.score.toFixed(2)} | ${originalModel} ${arrow} ${newModel}`);
+  console.log(`${source} ${color}[${classification.tier.toUpperCase()}]${reset} Score: ${classification.score.toFixed(2)} | ${originalModel} ${arrow} ${newModel}`);
   
   if (CONFIG.verbose) {
     console.log(`  Prompt: "${prompt.substring(0, 80)}${prompt.length > 80 ? '...' : ''}"`);
@@ -97,16 +102,27 @@ app.post('/v1/messages', async (req, res) => {
   
   // Classify and determine target model
   let targetModel = originalModel;
-  let classification = { tier: 'passthrough', score: 0 };
+  let classification = { tier: 'passthrough', score: 0, source: 'none' };
   
   if (!CONFIG.disabled && !CONFIG.forceModel) {
-    classification = classify(prompt, {
+    const classifyConfig = {
       simpleModel: CONFIG.simpleModel,
       mediumModel: CONFIG.mediumModel,
       complexModel: CONFIG.complexModel,
       simpleThreshold: CONFIG.simpleThreshold,
       complexThreshold: CONFIG.complexThreshold,
-    });
+    };
+    
+    // Try Ollama first, fallback to heuristics
+    if (ollamaAvailable) {
+      classification = await classifyOllama(prompt, classifyConfig);
+    }
+    
+    // Fallback to heuristics if Ollama failed or unavailable
+    if (!classification || classification.source !== 'ollama') {
+      classification = classifyHeuristics(prompt, classifyConfig);
+      classification.source = 'heuristics';
+    }
     
     targetModel = classification.model;
     stats.routed[classification.tier]++;
@@ -117,7 +133,7 @@ app.post('/v1/messages', async (req, res) => {
     }
   } else if (CONFIG.forceModel) {
     targetModel = CONFIG.forceModel;
-    classification = { tier: 'forced', score: 0 };
+    classification = { tier: 'forced', score: 0, source: 'forced' };
   }
   
   logDecision(originalModel, targetModel, classification, prompt);
@@ -208,12 +224,21 @@ app.get('/_health', (req, res) => {
 });
 
 // Start server
-app.listen(CONFIG.port, () => {
-  console.log(`
+async function start() {
+  // Check Ollama availability
+  ollamaAvailable = await isOllamaAvailable();
+  
+  app.listen(CONFIG.port, () => {
+    const classifierStatus = ollamaAvailable 
+      ? '🧠 Ollama (accurate)' 
+      : '📏 Heuristics (fast)';
+    
+    console.log(`
 ╔═══════════════════════════════════════════════════════════╗
 ║              🧠 Smart Router Proxy v1.0                    ║
 ╠═══════════════════════════════════════════════════════════╣
 ║  Listening on: http://localhost:${CONFIG.port}                    ║
+║  Classifier:   ${classifierStatus.padEnd(35)}║
 ║                                                           ║
 ║  Model Routing:                                           ║
 ║    Simple  (< ${CONFIG.simpleThreshold.toFixed(2)}) → ${CONFIG.simpleModel.padEnd(28)}║
@@ -226,5 +251,15 @@ app.listen(CONFIG.port, () => {
 ║                                                           ║
 ║  Stats: http://localhost:${CONFIG.port}/_stats                    ║
 ╚═══════════════════════════════════════════════════════════╝
-  `);
-});
+    `);
+    
+    if (!ollamaAvailable) {
+      console.log('  💡 For better accuracy, install Ollama:');
+      console.log('     curl -fsSL https://ollama.com/install.sh | sh');
+      console.log('     ollama pull phi3:mini');
+      console.log('');
+    }
+  });
+}
+
+start();
